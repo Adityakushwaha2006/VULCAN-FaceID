@@ -439,7 +439,7 @@ class FaceIdentificationSystem:
                 break
             
             annotated_frame = self.process_frame(frame)
-            cv2.imshow('Face Identification System', annotated_frame)
+            cv2.imshow('Vulcan CV', annotated_frame)
             
             frame_count += 1
             if frame_count % save_interval == 0:
