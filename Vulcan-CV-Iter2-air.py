@@ -1,15 +1,16 @@
 """
-Enhanced Real-Time Face Detection and Identification System for Vulcan ERC Humanoid
+Enhanced Real-Time Face Detection, Pose Estimation, and Hand Tracking System
+for Vulcan ERC Humanoid
 
-Improvements:
-- Name field management for ERC members
-- Training mode for reducing false positives
-- Dynamic name assignment during runtime
-- Database cleanup for unnamed strangers
-- Improved accuracy with confidence scores
+New Features:
+- Full body pose estimation (33 landmarks)
+- Hand skeleton tracking (21 landmarks per hand)
+- Toggle controls for each feature
+- Real-time skeleton visualization
 
 Author: Aaditya Kushawaha, Anirudh Singh Air
 Project: Vulcan ERC
+Enhanced with Pose & Hand Tracking
 """
 
 import cv2
@@ -22,15 +23,25 @@ from scipy.spatial.distance import cosine, euclidean
 from pathlib import Path
 from collections import deque
 
+# MediaPipe for pose and hand tracking
+try:
+    import mediapipe as mp
+    MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    MEDIAPIPE_AVAILABLE = False
+    print("⚠ MediaPipe not installed. Install with: pip install mediapipe")
+
 class FaceIdentificationSystem:
     def __init__(self, 
                  db_path='face_database.pkl',
-                 similarity_threshold=0.6,
+                 similarity_threshold=0.4,
                  use_cosine=True,
                  training_mode=False,
-                 min_confidence=0.7):
+                 min_confidence=0.7,
+                 enable_pose=True,
+                 enable_hands=True):
         """
-        Initialize the Enhanced Face Identification System
+        Initialize the Enhanced Face Identification System with Pose & Hand Tracking
         
         Args:
             db_path: Path to save/load face database
@@ -38,6 +49,8 @@ class FaceIdentificationSystem:
             use_cosine: Use cosine distance (True) or Euclidean (False)
             training_mode: Enable training mode for ERC members
             min_confidence: Minimum confidence for face detection
+            enable_pose: Enable pose estimation
+            enable_hands: Enable hand tracking
         """
         self.db_path = db_path
         self.similarity_threshold = similarity_threshold
@@ -47,8 +60,13 @@ class FaceIdentificationSystem:
         self.face_db = {}
         self.next_id = 1
         
+        # Feature toggles
+        self.enable_pose = enable_pose and MEDIAPIPE_AVAILABLE
+        self.enable_hands = enable_hands and MEDIAPIPE_AVAILABLE
+        self.enable_face_detection = True
+        
         # Track recent detections for stability
-        self.detection_history = {}  # person_id -> deque of recent embeddings
+        self.detection_history = {}
         self.history_size = 5
         
         # Load existing database if available
@@ -57,6 +75,30 @@ class FaceIdentificationSystem:
         # Initialize face detector and recognizer
         self.detector = self._load_face_detector()
         self.recognizer = self._load_face_recognizer()
+        
+        # Initialize MediaPipe Pose and Hands
+        if MEDIAPIPE_AVAILABLE:
+            self.mp_pose = mp.solutions.pose
+            self.mp_hands = mp.solutions.hands
+            self.mp_drawing = mp.solutions.drawing_utils
+            self.mp_drawing_styles = mp.solutions.drawing_styles
+            
+            if self.enable_pose:
+                self.pose = self.mp_pose.Pose(
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                    model_complexity=1
+                )
+                print("✓ Pose estimation initialized")
+            
+            if self.enable_hands:
+                self.hands = self.mp_hands.Hands(
+                    static_image_mode=False,
+                    max_num_hands=2,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5
+                )
+                print("✓ Hand tracking initialized")
         
         print(f"System initialized with {len(self.face_db)} known faces")
         print(f"Training mode: {'ON' if training_mode else 'OFF'}")
@@ -98,12 +140,7 @@ class FaceIdentificationSystem:
             return None
     
     def detect_faces(self, frame):
-        """
-        Detect faces in the frame with confidence scores
-        
-        Returns:
-            List of tuples [(x, y, w, h, confidence), ...]
-        """
+        """Detect faces in the frame with confidence scores"""
         if isinstance(self.detector, cv2.CascadeClassifier):
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = self.detector.detectMultiScale(
@@ -152,12 +189,7 @@ class FaceIdentificationSystem:
             return euclidean(emb1, emb2)
     
     def match_or_create_id(self, embedding):
-        """
-        Match embedding against database with improved accuracy
-        
-        Returns:
-            Tuple of (person_id, is_new, confidence)
-        """
+        """Match embedding against database with improved accuracy"""
         if not self.face_db:
             person_id = f"P{self.next_id:03d}"
             self.next_id += 1
@@ -172,7 +204,6 @@ class FaceIdentificationSystem:
                 best_distance = distance
                 best_match_id = person_id
         
-        # Calculate confidence (inverse of distance)
         confidence = 1 - min(best_distance, 1.0)
         
         if best_distance < self.similarity_threshold:
@@ -186,13 +217,10 @@ class FaceIdentificationSystem:
         """Update face database with temporal smoothing"""
         current_time = datetime.now().isoformat()
         
-        # Initialize detection history
         if person_id not in self.detection_history:
             self.detection_history[person_id] = deque(maxlen=self.history_size)
         
         self.detection_history[person_id].append(embedding)
-        
-        # Use averaged embedding for stability
         avg_embedding = np.mean(list(self.detection_history[person_id]), axis=0)
         
         if is_new:
@@ -201,24 +229,87 @@ class FaceIdentificationSystem:
                 'first_seen': current_time,
                 'last_seen': current_time,
                 'appearances': 1,
-                'name': None,  # NEW: Name field
-                'is_erc_member': False  # NEW: ERC member flag
+                'name': None,
+                'is_erc_member': False
             }
         else:
             self.face_db[person_id]['last_seen'] = current_time
             self.face_db[person_id]['appearances'] += 1
-            # Smoother update for known faces
             old_emb = self.face_db[person_id]['embedding']
             self.face_db[person_id]['embedding'] = 0.85 * old_emb + 0.15 * avg_embedding
     
-    def assign_name(self, person_id, name):
-        """
-        Assign a name to a person ID
+    def draw_pose_landmarks(self, frame, results):
+        """Draw pose skeleton on frame"""
+        if not results.pose_landmarks:
+            return
         
-        Args:
-            person_id: Person identifier (e.g., 'P001')
-            name: Name to assign
-        """
+        # Draw the pose landmarks
+        self.mp_drawing.draw_landmarks(
+            frame,
+            results.pose_landmarks,
+            self.mp_pose.POSE_CONNECTIONS,
+            landmark_drawing_spec=self.mp_drawing_styles.get_default_pose_landmarks_style()
+        )
+        
+        # Add pose info overlay
+        landmarks = results.pose_landmarks.landmark
+        
+        # Calculate posture metrics
+        left_shoulder = landmarks[self.mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+        right_shoulder = landmarks[self.mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+        left_hip = landmarks[self.mp_pose.PoseLandmark.LEFT_HIP.value]
+        right_hip = landmarks[self.mp_pose.PoseLandmark.RIGHT_HIP.value]
+        
+        # Check visibility
+        if (left_shoulder.visibility > 0.5 and right_shoulder.visibility > 0.5 and
+            left_hip.visibility > 0.5 and right_hip.visibility > 0.5):
+            
+            shoulder_slope = abs(left_shoulder.y - right_shoulder.y)
+            hip_slope = abs(left_hip.y - right_hip.y)
+            
+            posture_status = "Good" if shoulder_slope < 0.05 and hip_slope < 0.05 else "Tilted"
+            color = (0, 255, 0) if posture_status == "Good" else (0, 165, 255)
+            
+            cv2.putText(frame, f"Posture: {posture_status}", (10, 90), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    
+    def draw_hand_landmarks(self, frame, results):
+        """Draw hand skeleton on frame"""
+        if not results.multi_hand_landmarks:
+            return
+        
+        hand_count = 0
+        for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+            # Draw hand landmarks
+            self.mp_drawing.draw_landmarks(
+                frame,
+                hand_landmarks,
+                self.mp_hands.HAND_CONNECTIONS,
+                self.mp_drawing_styles.get_default_hand_landmarks_style(),
+                self.mp_drawing_styles.get_default_hand_connections_style()
+            )
+            
+            # Get hand label (Left/Right)
+            hand_label = handedness.classification[0].label
+            hand_score = handedness.classification[0].score
+            
+            # Get wrist position for label
+            h, w, _ = frame.shape
+            wrist = hand_landmarks.landmark[self.mp_hands.HandLandmark.WRIST]
+            x, y = int(wrist.x * w), int(wrist.y * h)
+            
+            # Draw hand label
+            cv2.putText(frame, f"{hand_label} ({hand_score:.2f})", (x - 50, y - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+            
+            hand_count += 1
+        
+        # Display hand count
+        cv2.putText(frame, f"Hands: {hand_count}", (10, 120),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+    
+    def assign_name(self, person_id, name):
+        """Assign a name to a person ID"""
         if person_id in self.face_db:
             self.face_db[person_id]['name'] = name
             self.face_db[person_id]['is_erc_member'] = True
@@ -230,19 +321,14 @@ class FaceIdentificationSystem:
             return False
     
     def cleanup_strangers(self):
-        """
-        Remove all unnamed (stranger) entries from database
-        Keep only entries with assigned names (ERC members)
-        """
+        """Remove all unnamed (stranger) entries from database"""
         before_count = len(self.face_db)
         
-        # Keep only entries with names
         self.face_db = {
             pid: data for pid, data in self.face_db.items() 
             if data.get('name') is not None
         }
         
-        # Clear detection history for removed persons
         removed_ids = [pid for pid in self.detection_history if pid not in self.face_db]
         for pid in removed_ids:
             del self.detection_history[pid]
@@ -272,7 +358,7 @@ class FaceIdentificationSystem:
                 'id': person_id,
                 'name': data.get('name', 'UNNAMED'),
                 'appearances': data['appearances'],
-                'first_seen': data['first_seen'][:19],  # Trim milliseconds
+                'first_seen': data['first_seen'][:19],
                 'last_seen': data['last_seen'][:19],
                 'erc_member': data.get('is_erc_member', False)
             }
@@ -349,62 +435,92 @@ class FaceIdentificationSystem:
                 self.next_id = 1
     
     def process_frame(self, frame):
-        """Process a single frame with enhanced annotations"""
-        faces = self.detect_faces(frame)
+        """Process a single frame with face detection, pose, and hand tracking"""
+        # Convert to RGB for MediaPipe
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        for (x, y, w, h, confidence) in faces:
-            x, y = max(0, x), max(0, y)
-            w = min(w, frame.shape[1] - x)
-            h = min(h, frame.shape[0] - y)
+        # Process pose
+        if self.enable_pose:
+            pose_results = self.pose.process(frame_rgb)
+            if pose_results.pose_landmarks:
+                self.draw_pose_landmarks(frame, pose_results)
+        
+        # Process hands
+        if self.enable_hands:
+            hand_results = self.hands.process(frame_rgb)
+            if hand_results.multi_hand_landmarks:
+                self.draw_hand_landmarks(frame, hand_results)
+        
+        # Process faces
+        if self.enable_face_detection:
+            faces = self.detect_faces(frame)
             
-            face_img = frame[y:y+h, x:x+w]
-            if face_img.size == 0:
-                continue
-            
-            embedding = self.get_embedding(face_img)
-            person_id, is_new, match_confidence = self.match_or_create_id(embedding)
-            self.update_database(person_id, embedding, is_new)
-            
-            # Get person data
-            person_data = self.face_db[person_id]
-            name = person_data.get('name')
-            is_erc = person_data.get('is_erc_member', False)
-            
-            # Color coding: Blue=ERC Member, Green=Known, Orange=New
-            if is_erc:
-                color = (255, 100, 0)  # Blue
-            elif not is_new:
-                color = (0, 255, 0)    # Green
-            else:
-                color = (0, 165, 255)  # Orange
-            
-            cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-            
-            # Prepare label
-            if name:
-                label = f"{name} ({person_id})"
-            else:
-                label = f"{person_id}"
-                if is_new:
-                    label += " (NEW)"
-            
-            appearances = person_data['appearances']
-            label += f" [{appearances}]"
-            
-            if not is_new:
-                label += f" {match_confidence:.0%}"
-            
-            # Draw label
-            (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            cv2.rectangle(frame, (x, y - label_h - 10), (x + label_w, y), color, -1)
-            cv2.putText(frame, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 
-                       0.5, (255, 255, 255), 2)
+            for (x, y, w, h, confidence) in faces:
+                x, y = max(0, x), max(0, y)
+                w = min(w, frame.shape[1] - x)
+                h = min(h, frame.shape[0] - y)
+                
+                face_img = frame[y:y+h, x:x+w]
+                if face_img.size == 0:
+                    continue
+                
+                embedding = self.get_embedding(face_img)
+                person_id, is_new, match_confidence = self.match_or_create_id(embedding)
+                self.update_database(person_id, embedding, is_new)
+                
+                # Get person data
+                person_data = self.face_db[person_id]
+                name = person_data.get('name')
+                is_erc = person_data.get('is_erc_member', False)
+                
+                # Color coding
+                if is_erc:
+                    color = (255, 100, 0)  # Blue
+                elif not is_new:
+                    color = (0, 255, 0)    # Green
+                else:
+                    color = (0, 165, 255)  # Orange
+                
+                cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+                
+                # Prepare label
+                if name:
+                    label = f"{name} ({person_id})"
+                else:
+                    label = f"{person_id}"
+                    if is_new:
+                        label += " (NEW)"
+                
+                appearances = person_data['appearances']
+                label += f" [{appearances}]"
+                
+                if not is_new:
+                    label += f" {match_confidence:.0%}"
+                
+                # Draw label
+                (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                cv2.rectangle(frame, (x, y - label_h - 10), (x + label_w, y), color, -1)
+                cv2.putText(frame, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 
+                           0.5, (255, 255, 255), 2)
         
         # Display statistics
         erc_count = sum(1 for d in self.face_db.values() if d.get('is_erc_member'))
-        stats = f"Total: {len(self.face_db)} | ERC: {erc_count} | Current: {len(faces)}"
+        stats = f"Total: {len(self.face_db)} | ERC: {erc_count}"
         cv2.putText(frame, stats, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
                    0.7, (0, 255, 255), 2)
+        
+        # Display feature status
+        features = []
+        if self.enable_face_detection:
+            features.append("Face")
+        if self.enable_pose:
+            features.append("Pose")
+        if self.enable_hands:
+            features.append("Hands")
+        
+        status = f"Active: {', '.join(features)}"
+        cv2.putText(frame, status, (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
+                   0.6, (255, 255, 255), 2)
         
         return frame
     
@@ -417,7 +533,7 @@ class FaceIdentificationSystem:
             return
         
         print("\n" + "="*70)
-        print("FACE IDENTIFICATION SYSTEM - RUNNING")
+        print("FACE IDENTIFICATION + POSE + HAND TRACKING SYSTEM - RUNNING")
         print("="*70)
         print("CONTROLS:")
         print("  q - Quit")
@@ -427,6 +543,9 @@ class FaceIdentificationSystem:
         print("  c - Cleanup strangers")
         print("  e - Export database to JSON")
         print("  r - Reset entire database")
+        print("  f - Toggle face detection")
+        print("  p - Toggle pose estimation")
+        print("  h - Toggle hand tracking")
         print("="*70 + "\n")
         
         frame_count = 0
@@ -439,7 +558,7 @@ class FaceIdentificationSystem:
                 break
             
             annotated_frame = self.process_frame(frame)
-            cv2.imshow('Vulcan CV', annotated_frame)
+            cv2.imshow('Vulcan Enhanced CV', annotated_frame)
             
             frame_count += 1
             if frame_count % save_interval == 0:
@@ -451,9 +570,19 @@ class FaceIdentificationSystem:
                 break
             elif key == ord('s'):
                 self.save_database()
+            elif key == ord('f'):
+                self.enable_face_detection = not self.enable_face_detection
+                print(f"Face detection: {'ON' if self.enable_face_detection else 'OFF'}")
+            elif key == ord('p'):
+                if MEDIAPIPE_AVAILABLE:
+                    self.enable_pose = not self.enable_pose
+                    print(f"Pose estimation: {'ON' if self.enable_pose else 'OFF'}")
+            elif key == ord('h'):
+                if MEDIAPIPE_AVAILABLE:
+                    self.enable_hands = not self.enable_hands
+                    print(f"Hand tracking: {'ON' if self.enable_hands else 'OFF'}")
             elif key == ord('n'):
-                # Assign name
-                cv2.waitKey(1)  # Clear buffer
+                cv2.waitKey(1)
                 person_id = input("\nEnter Person ID (e.g., P001): ").strip().upper()
                 name = input("Enter Name: ").strip()
                 if person_id and name:
@@ -483,18 +612,35 @@ class FaceIdentificationSystem:
 def main():
     """Main entry point with menu"""
     print("="*70)
-    print("ENHANCED FACE IDENTIFICATION SYSTEM FOR VULCAN ERC")
+    print("ENHANCED FACE ID + POSE + HAND TRACKING SYSTEM FOR VULCAN ERC")
     print("="*70)
+    
+    if not MEDIAPIPE_AVAILABLE:
+        print("\n⚠ WARNING: MediaPipe not available")
+        print("Install with: pip install mediapipe")
+        print("Continuing with face detection only...\n")
     
     mode = input("\nSelect mode:\n1. Normal Mode\n2. Training Mode (for ERC members)\nChoice (1/2): ").strip()
     training_mode = (mode == '2')
     
+    # Feature selection
+    enable_pose = True
+    enable_hands = True
+    
+    if MEDIAPIPE_AVAILABLE:
+        features = input("\nEnable features:\n1. All (Face + Pose + Hands)\n2. Custom\nChoice (1/2): ").strip()
+        if features == '2':
+            enable_pose = input("Enable pose estimation? (y/n): ").lower() == 'y'
+            enable_hands = input("Enable hand tracking? (y/n): ").lower() == 'y'
+    
     system = FaceIdentificationSystem(
         db_path='face_database.pkl',
-        similarity_threshold=0.55,  # Slightly stricter for better accuracy
+        similarity_threshold=0.55,
         use_cosine=True,
         training_mode=training_mode,
-        min_confidence=0.7
+        min_confidence=0.7,
+        enable_pose=enable_pose,
+        enable_hands=enable_hands
     )
     
     # Pre-run menu
